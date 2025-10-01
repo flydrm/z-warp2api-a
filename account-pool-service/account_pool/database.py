@@ -294,6 +294,10 @@ class AccountDatabase:
             logger.error(f"标记账号过期失败: {e}")
             return False
     
+    def mark_account_as_expired(self, email: str) -> bool:
+        """标记账号为过期状态（别名方法）"""
+        return self.mark_account_expired(email)
+    
     def get_pool_statistics(self) -> Dict[str, int]:
         """获取账号池统计信息"""
         with self._get_cursor() as cursor:

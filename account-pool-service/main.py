@@ -307,6 +307,42 @@ async def get_account_info(email: str):
         logger.error(f"获取账号信息失败: {e}")
         raise HTTPException(status_code=500, detail=f"获取账号信息失败: {str(e)}")
 
+@app.delete("/api/accounts/{email}")
+async def delete_account(email: str):
+    """删除指定账号（标记为失效）"""
+    if not pool_manager:
+        raise HTTPException(status_code=503, detail="服务不可用")
+    
+    try:
+        logger.warning(f"收到删除账号请求: {email}")
+        
+        # 检查账号是否存在
+        account = pool_manager.db.get_account_by_email(email)
+        if not account:
+            raise HTTPException(status_code=404, detail=f"账号 {email} 不存在")
+        
+        # 标记为过期/失效
+        success = pool_manager.db.mark_account_as_expired(email)
+        
+        if success:
+            logger.info(f"✅ 成功删除账号: {email}")
+            return {
+                "success": True,
+                "message": f"账号 {email} 已标记为失效"
+            }
+        else:
+            logger.error(f"❌ 删除账号失败: {email}")
+            return {
+                "success": False,
+                "message": f"删除账号 {email} 失败"
+            }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"删除账号异常: {e}")
+        raise HTTPException(status_code=500, detail=f"删除账号失败: {str(e)}")
+
 # 错误处理
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
