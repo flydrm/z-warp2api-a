@@ -22,6 +22,7 @@ from fastapi.responses import Response
 from typing import Any
 
 from warp2protobuf.api.protobuf_routes import app as protobuf_app
+from warp2protobuf.api.warp_routes_v2 import router_v2
 from warp2protobuf.core.logging import logger, set_log_file
 from warp2protobuf.api.protobuf_routes import EncodeRequest, _encode_smd_inplace
 from warp2protobuf.core.protobuf_utils import dict_to_protobuf_bytes
@@ -222,6 +223,9 @@ def create_app() -> FastAPI:
 
     # 将protobuf路由包含到主应用中
     app.mount("/", protobuf_app)
+    
+    # 注册V2路由（优化版429处理）
+    app.include_router(router_v2, tags=["warp-v2"])
 
     # 挂载输入 schema 清理中间件（覆盖 Warp 相关端点）
 

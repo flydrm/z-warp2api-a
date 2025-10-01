@@ -3,6 +3,7 @@
 """
 账号池认证模块
 从账号池服务获取账号，替代临时账号注册
+支持智能429重试（通过环境变量控制）
 """
 
 import os
@@ -10,7 +11,7 @@ import json
 import time
 import asyncio
 import httpx
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Callable
 from datetime import datetime
 import threading
 
@@ -20,6 +21,12 @@ from .auth import decode_jwt_payload, is_token_expired, update_env_file
 # 账号池服务配置
 POOL_SERVICE_URL = os.getenv("POOL_SERVICE_URL", "http://localhost:8019")
 USE_POOL_SERVICE = os.getenv("USE_POOL_SERVICE", "true").lower() == "true"
+
+# 429优化配置
+ENABLE_SMART_429_RETRY = os.getenv("ENABLE_SMART_429_RETRY", "true").lower() == "true"
+MAX_429_RETRIES = int(os.getenv("MAX_429_RETRIES", "3"))
+DELETE_FAILED_ACCOUNTS = os.getenv("DELETE_FAILED_ACCOUNTS", "true").lower() == "true"
+AUTO_REPLENISH_POOL = os.getenv("AUTO_REPLENISH_POOL", "true").lower() == "true"
 
 # 全局账号信息
 _current_session: Optional[Dict[str, Any]] = None
@@ -285,3 +292,169 @@ def get_current_account_info() -> Optional[Dict[str, Any]]:
                     "created_at": _current_session.get("created_at")
                 }
     return None
+
+
+async def handle_429_with_smart_retry(
+    error_content: str,
+    execute_request_func: Callable,
+    session_id: Optional[str] = None
+) -> Any:
+    """
+    智能429重试处理（通过环境变量控制）
+    
+    Args:
+        error_content: 429错误内容
+        execute_request_func: 执行请求的异步函数，接收jwt参数
+        session_id: 会话ID（可选）
+        
+    Returns:
+        请求结果
+        
+    Raises:
+        RuntimeError: 重试失败或未启用智能重试
+    """
+    # 检查是否启用智能重试
+    if not ENABLE_SMART_429_RETRY:
+        logger.info("智能429重试未启用，使用旧逻辑（临时账号）")
+        from .auth import acquire_anonymous_access_token
+        try:
+            new_jwt = await acquire_anonymous_access_token()
+            return await execute_request_func(new_jwt)
+        except Exception as e:
+            raise RuntimeError(f"临时账号获取失败: {str(e)}")
+    
+    # 检查是否为配额用尽错误
+    is_quota_error = ("No remaining quota" in error_content) or ("No AI requests remaining" in error_content)
+    if not is_quota_error:
+        logger.warning(f"429错误但非配额用尽，不进行智能重试")
+        raise RuntimeError(f"429错误: {error_content}")
+    
+    logger.warning(f"🔄 启动智能429重试（最多{MAX_429_RETRIES}次）")
+    
+    if not USE_POOL_SERVICE:
+        raise RuntimeError("账号池服务未启用，无法进行智能重试")
+    
+    manager = get_pool_manager()
+    
+    # 获取当前失败的账号（如果有）
+    current_account = get_current_account_info()
+    if current_account and DELETE_FAILED_ACCOUNTS:
+        failed_email = current_account.get("email")
+        if failed_email:
+            logger.warning(f"标记失败账号: {failed_email}")
+            asyncio.create_task(_delete_failed_account(failed_email))
+    
+    # 释放当前会话
+    await release_pool_session()
+    
+    # 重试循环
+    for attempt in range(1, MAX_429_RETRIES + 1):
+        try:
+            logger.info(f"📍 第 {attempt}/{MAX_429_RETRIES} 次重试：从账号池获取新账号...")
+            
+            # 获取新账号
+            new_jwt = await manager.acquire_pool_access_token()
+            current_account = get_current_account_info()
+            if current_account:
+                logger.info(f"✅ 使用账号: {current_account.get('email')}")
+            
+            # 执行请求
+            result = await execute_request_func(new_jwt)
+            
+            logger.info(f"🎉 第 {attempt} 次重试成功！")
+            
+            # 触发账号池补充检查
+            if AUTO_REPLENISH_POOL:
+                asyncio.create_task(_trigger_pool_replenish())
+            
+            return result
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            # 检查是否又是429错误
+            if "429" in error_msg:
+                logger.error(f"❌ 第 {attempt} 次重试仍返回429: {error_msg[:100]}")
+                
+                # 标记当前账号为失败
+                if DELETE_FAILED_ACCOUNTS:
+                    current_account = get_current_account_info()
+                    if current_account:
+                        failed_email = current_account.get("email")
+                        asyncio.create_task(_delete_failed_account(failed_email))
+                
+                # 释放会话准备下次重试
+                await release_pool_session()
+                
+                # 如果还有重试机会，继续
+                if attempt < MAX_429_RETRIES:
+                    logger.info(f"⏳ 继续下一次重试...")
+                    await asyncio.sleep(1)  # 短暂延迟
+                    continue
+                else:
+                    logger.error(f"💥 已达最大重试次数({MAX_429_RETRIES})，放弃")
+                    # 最后触发账号池补充
+                    if AUTO_REPLENISH_POOL:
+                        asyncio.create_task(_trigger_pool_replenish())
+                    raise RuntimeError(f"429错误重试{MAX_429_RETRIES}次后仍失败")
+            else:
+                # 其他错误，直接抛出
+                logger.error(f"❌ 请求失败（非429）: {error_msg[:100]}")
+                raise
+
+
+async def _delete_failed_account(email: str):
+    """删除失败账号（异步后台任务）"""
+    try:
+        logger.info(f"🗑️ 删除失败账号: {email}")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            response = await client.delete(
+                f"{POOL_SERVICE_URL}/api/accounts/{email}"
+            )
+            if response.status_code == 200:
+                logger.info(f"✅ 成功删除失败账号: {email}")
+            else:
+                logger.warning(f"删除账号失败: HTTP {response.status_code}")
+    except Exception as e:
+        logger.error(f"删除账号异常: {e}")
+
+
+async def _trigger_pool_replenish():
+    """触发账号池补充检查（异步后台任务）"""
+    try:
+        logger.info("🔍 检查账号池是否需要补充...")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            # 获取账号池状态
+            response = await client.get(f"{POOL_SERVICE_URL}/api/accounts/status")
+            
+            if response.status_code != 200:
+                logger.warning(f"获取账号池状态失败: HTTP {response.status_code}")
+                return
+            
+            status = response.json()
+            pool_stats = status.get("pool_stats", {})
+            available = pool_stats.get("available", 0)
+            min_size = status.get("min_pool_size", 5)
+            
+            logger.info(f"账号池状态: 可用={available}, 最小值={min_size}")
+            
+            # 如果低于最小值，触发补充
+            if available < min_size:
+                needed = min_size - available
+                logger.warning(f"⚠️ 账号池不足！触发补充 {needed} 个账号")
+                
+                # 调用补充接口
+                response = await client.post(
+                    f"{POOL_SERVICE_URL}/api/accounts/replenish",
+                    json={"count": needed}
+                )
+                
+                if response.status_code == 200:
+                    logger.info(f"✅ 成功触发账号池补充: {needed} 个")
+                else:
+                    logger.error(f"触发账号池补充失败: HTTP {response.status_code}")
+            else:
+                logger.info("✅ 账号池充足，无需补充")
+                
+    except Exception as e:
+        logger.error(f"触发账号池补充异常: {e}")

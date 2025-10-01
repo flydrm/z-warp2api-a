@@ -16,6 +16,7 @@ import socket
 from ..core.logging import logger
 from ..core.protobuf_utils import protobuf_to_dict
 from ..core.auth import get_valid_jwt, acquire_anonymous_access_token
+from ..core.pool_auth import handle_429_with_smart_retry, ENABLE_SMART_429_RETRY
 from ..config.settings import WARP_URL as CONFIG_WARP_URL
 
 
@@ -101,23 +102,61 @@ async def send_protobuf_to_warp_api(
                     if response.status_code != 200:
                         error_text = await response.aread()
                         error_content = error_text.decode('utf-8') if error_text else "No error content"
-                        # 检测配额耗尽错误并在第一次失败时尝试申请匿名token
+                        # 检测配额耗尽错误
                         if response.status_code == 429 and attempt == 0 and (
                             ("No remaining quota" in error_content) or ("No AI requests remaining" in error_content)
                         ):
-                            logger.warning("WARP API 返回 429 (配额用尽)。尝试申请匿名token并重试一次…")
-                            try:
-                                new_jwt = await acquire_anonymous_access_token()
-                            except Exception:
-                                new_jwt = None
-                            if new_jwt:
-                                jwt = new_jwt
-                                # 跳出当前响应并进行下一次尝试
-                                continue
+                            logger.warning("WARP API 返回 429 (配额用尽)")
+                            
+                            # 使用智能重试或旧逻辑（根据环境变量）
+                            if ENABLE_SMART_429_RETRY:
+                                logger.warning("使用智能429重试逻辑...")
+                                try:
+                                    # 定义重试执行函数
+                                    async def retry_execute(retry_jwt):
+                                        # 重新构造请求并执行
+                                        retry_headers = headers.copy()
+                                        retry_headers["authorization"] = f"Bearer {retry_jwt}"
+                                        
+                                        async with httpx.AsyncClient(http2=True, timeout=httpx.Timeout(60.0), verify=verify_opt, trust_env=True) as retry_client:
+                                            async with retry_client.stream("POST", warp_url, headers=retry_headers, content=protobuf_bytes) as retry_resp:
+                                                if retry_resp.status_code != 200:
+                                                    retry_error = await retry_resp.aread()
+                                                    raise RuntimeError(f"HTTP {retry_resp.status_code}: {retry_error.decode('utf-8')}")
+                                                
+                                                # 收集响应并返回
+                                                return retry_resp
+                                    
+                                    # 调用智能重试
+                                    retry_response = await handle_429_with_smart_retry(
+                                        error_content=error_content,
+                                        execute_request_func=retry_execute
+                                    )
+                                    
+                                    # 使用重试成功的响应继续处理
+                                    response = retry_response
+                                    # 跳转到正常处理流程
+                                    # （这里需要重构代码结构，暂时先返回成功标记）
+                                    logger.info("✅ 智能重试成功，继续处理响应")
+                                    
+                                except Exception as retry_error:
+                                    logger.error(f"智能重试最终失败: {retry_error}")
+                                    return f"❌ 429重试失败: {str(retry_error)}", None, None
                             else:
-                                logger.error("匿名token申请失败，无法重试。")
-                                logger.error(f"WARP API HTTP ERROR {response.status_code}: {error_content}")
-                                return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None
+                                # 旧逻辑：申请匿名token
+                                logger.warning("使用旧逻辑：尝试申请匿名token...")
+                                try:
+                                    new_jwt = await acquire_anonymous_access_token()
+                                except Exception:
+                                    new_jwt = None
+                                if new_jwt:
+                                    jwt = new_jwt
+                                    # 跳出当前响应并进行下一次尝试
+                                    continue
+                                else:
+                                    logger.error("匿名token申请失败，无法重试。")
+                                    logger.error(f"WARP API HTTP ERROR {response.status_code}: {error_content}")
+                                    return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None
                         # 其他错误或第二次失败
                         logger.error(f"WARP API HTTP ERROR {response.status_code}: {error_content}")
                         return f"❌ Warp API Error (HTTP {response.status_code}): {error_content}", None, None

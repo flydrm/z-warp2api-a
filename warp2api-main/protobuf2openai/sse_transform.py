@@ -11,7 +11,7 @@ from .config import BRIDGE_BASE_URL
 from .helpers import _get
 
 
-async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_ts: int, model_id: str) -> AsyncGenerator[str, None]:
+async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_ts: int, model_id: str, session_id: str = None) -> AsyncGenerator[str, None]:
     try:
         first = {
             "id": completion_id,
@@ -30,34 +30,27 @@ async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_
         timeout = httpx.Timeout(60.0)
         async with httpx.AsyncClient(http2=True, timeout=timeout, trust_env=True) as client:
             def _do_stream():
+                # 使用session_id，如果没有则使用completion_id
+                sid = session_id or completion_id
                 return client.stream(
                     "POST",
-                    f"{BRIDGE_BASE_URL}/api/warp/send_stream_sse",
+                    f"{BRIDGE_BASE_URL}/api/warp/send_stream_sse_v2?session_id={sid}",  # V2端点，自动429重试
                     headers={"accept": "text/event-stream"},
                     json={"json_data": packet, "message_type": "warp.multi_agent.v1.Request"},
                 )
 
-            # 首次请求
+            # V2端点已包含智能429重试，这里只需处理正常响应
             response_cm = _do_stream()
             async with response_cm as response:
-                if response.status_code == 429:
-                    try:
-                        r = await client.post(f"{BRIDGE_BASE_URL}/api/auth/refresh", timeout=10.0)
-                        logger.warning("[OpenAI Compat] Bridge returned 429. Tried JWT refresh -> HTTP %s", r.status_code)
-                    except Exception as _e:
-                        logger.warning("[OpenAI Compat] JWT refresh attempt failed after 429: %s", _e)
-                    # 重试一次
-                    response_cm2 = _do_stream()
-                    async with response_cm2 as response2:
-                        response = response2
-                        if response.status_code != 200:
-                            error_text = await response.aread()
-                            error_content = error_text.decode("utf-8") if error_text else ""
-                            logger.error(f"[OpenAI Compat] Bridge HTTP error {response.status_code}: {error_content[:300]}")
-                            raise RuntimeError(f"bridge error: {error_content}")
-                        current = ""
-                        tool_calls_emitted = False
-                        async for line in response.aiter_lines():
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    error_content = error_text.decode("utf-8") if error_text else ""
+                    logger.error(f"[OpenAI Compat] Bridge HTTP error {response.status_code}: {error_content[:300]}")
+                    raise RuntimeError(f"bridge error: {error_content}")
+                
+                current = ""
+                tool_calls_emitted = False
+                async for line in response.aiter_lines():
                             if line.startswith("data:"):
                                 payload = line[5:].strip()
                                 if not payload:

@@ -21,6 +21,7 @@ from ..core.logging import logger
 from ..core.protobuf_utils import protobuf_to_dict, dict_to_protobuf_bytes
 from ..core.auth import get_jwt_token, is_token_expired, refresh_jwt_if_needed, get_valid_jwt
 from ..core.pool_auth import acquire_pool_or_anonymous_token
+from ..core.pool_auth_v2 import get_pool_manager_v2, handle_429_with_retry
 from ..core.stream_processor import get_stream_processor, set_websocket_manager
 from ..config.models import get_all_unique_models
 from ..config.settings import CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION, WARP_URL as CONFIG_WARP_URL
@@ -454,7 +455,7 @@ async def send_to_warp_api_parsed(
 
 
 @app.post("/api/warp/send_stream_sse")
-async def send_to_warp_api_stream_sse(request: EncodeRequest):
+async def send_to_warp_api_stream_sse(request: EncodeRequest, session_id: str = Query(None, description="会话ID用于账号绑定")):
     from fastapi.responses import StreamingResponse
     import os as _os
     import re as _re
