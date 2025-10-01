@@ -136,29 +136,26 @@ async def chat_completions(req: ChatCompletionsRequest):
     created_ts = int(time.time())
     completion_id = str(uuid.uuid4())
     model_id = req.model or "warp-default"
+    
+    # 使用completion_id作为session_id，启用V2智能429重试
+    session_id = completion_id
 
     if req.stream:
         async def _agen():
-            async for chunk in stream_openai_sse(packet, completion_id, created_ts, model_id):
+            async for chunk in stream_openai_sse(packet, completion_id, created_ts, model_id, session_id):
                 yield chunk
         return StreamingResponse(_agen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     def _post_once() -> requests.Response:
         return requests.post(
-            f"{BRIDGE_BASE_URL}/api/warp/send_stream",
+            f"{BRIDGE_BASE_URL}/api/warp/send_stream_v2?session_id={session_id}",  # V2端点，自动429重试
             json={"json_data": packet, "message_type": "warp.multi_agent.v1.Request"},
             timeout=(5.0, 180.0),
         )
 
     try:
         resp = _post_once()
-        if resp.status_code == 429:
-            try:
-                r = requests.post(f"{BRIDGE_BASE_URL}/api/auth/refresh", timeout=10.0)
-                logger.warning("[OpenAI Compat] Bridge returned 429. Tried JWT refresh -> HTTP %s", getattr(r, 'status_code', 'N/A'))
-            except Exception as _e:
-                logger.warning("[OpenAI Compat] JWT refresh attempt failed after 429: %s", _e)
-            resp = _post_once()
+        # V2端点已包含智能429重试，这里只需检查最终结果
         if resp.status_code != 200:
             raise HTTPException(resp.status_code, f"bridge_error: {resp.text}")
         bridge_resp = resp.json()
